@@ -39,11 +39,13 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+from urllib3.util.timeout import Timeout
 from urllib3.util.retry import Retry
 
 from app.models import CrawlSession, Document, User
 from app.config import (
-    RAW_STORAGE_DIR, REQUEST_DELAY, CRAWL_TIMEOUT,
+    RAW_STORAGE_DIR, REQUEST_DELAY,
+    CRAWL_CONNECT_TIMEOUT, CRAWL_READ_TIMEOUT, CRAWL_TOTAL_TIMEOUT,
     USER_AGENT, TRACKING_PARAMS, MAX_FILE_SIZE_BYTES,
     CHUNK_SIZE, MAX_DOWNLOAD_TIME, CRAWL_MAX_RETRIES,
     MAX_PAGES_ABSOLUTE, MAX_MINUTES_ABSOLUTE,
@@ -133,9 +135,13 @@ def get_session_with_retries() -> requests.Session:
     # Retry configuration with exponential backoff
     retry_strategy = Retry(
         total=CRAWL_MAX_RETRIES,
+        connect=CRAWL_MAX_RETRIES,
+        read=CRAWL_MAX_RETRIES,
+        status=CRAWL_MAX_RETRIES,
         backoff_factor=1,  # 1s, 2s, 4s delays
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "HEAD"],
+        respect_retry_after_header=True,
         raise_on_status=False  # Let us handle status codes
     )
     
@@ -151,6 +157,20 @@ def get_session_with_retries() -> requests.Session:
     session.headers.update({'User-Agent': USER_AGENT})
     
     return session
+
+
+def build_request_timeout() -> Timeout:
+    """
+    Build per-request timeout configuration.
+
+    NOTE: Timeout objects are stateful in urllib3, so create a fresh instance
+    for each request.
+    """
+    return Timeout(
+        connect=CRAWL_CONNECT_TIMEOUT,
+        read=CRAWL_READ_TIMEOUT,
+        total=CRAWL_TOTAL_TIMEOUT
+    )
 
 
 # ============================================================================
@@ -471,7 +491,7 @@ def download_pdf_streaming(
         
         response = session.get(
             url,
-            timeout=CRAWL_TIMEOUT,
+            timeout=build_request_timeout(),
             stream=True  # CRITICAL: Stream to avoid memory issues
         )
         
@@ -670,7 +690,7 @@ def crawl_domain(
         logger.debug(f'[Crawl {crawl_id}] Page {pages_crawled}/{max_pages}: {url}')
         
         try:
-            resp = session.get(url, timeout=CRAWL_TIMEOUT)
+            resp = session.get(url, timeout=build_request_timeout())
             
             if resp.status_code != 200:
                 logger.debug(

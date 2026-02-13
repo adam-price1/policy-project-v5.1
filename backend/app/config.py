@@ -15,7 +15,7 @@ FIXES APPLIED:
 import os
 import logging
 from pathlib import Path
-from typing import List
+from typing import List, Set
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +108,11 @@ MAX_MINUTES_ABSOLUTE = int(os.getenv("MAX_MINUTES_ABSOLUTE", "180"))  # 3 hours 
 
 # Request behavior
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))  # seconds between requests
-CRAWL_TIMEOUT = int(os.getenv("CRAWL_TIMEOUT", "10"))  # seconds per request
+CRAWL_CONNECT_TIMEOUT = float(os.getenv("CRAWL_CONNECT_TIMEOUT", "5"))  # seconds
+CRAWL_READ_TIMEOUT = float(os.getenv("CRAWL_READ_TIMEOUT", "30"))  # seconds
+CRAWL_TOTAL_TIMEOUT = float(os.getenv("CRAWL_TOTAL_TIMEOUT", "60"))  # seconds
+# Backward compatibility alias; use CRAWL_TOTAL_TIMEOUT for new code.
+CRAWL_TIMEOUT = CRAWL_TOTAL_TIMEOUT
 CRAWL_MAX_RETRIES = int(os.getenv("CRAWL_MAX_RETRIES", "3"))
 USER_AGENT = os.getenv("USER_AGENT", "PolicyCheckBot/6.0 (+https://policycheck.io/bot)")
 
@@ -142,6 +146,31 @@ RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
 RATE_LIMIT_CRAWL_START = int(os.getenv("RATE_LIMIT_CRAWL_START", "5"))  # requests per minute
 RATE_LIMIT_DELAY_MIN = float(os.getenv("RATE_LIMIT_DELAY_MIN", "0.5"))
 RATE_LIMIT_DELAY_MAX = float(os.getenv("RATE_LIMIT_DELAY_MAX", "2.0"))
+
+# API request rate limiting (security middleware)
+API_RATE_LIMIT_ENABLED = os.getenv(
+    "API_RATE_LIMIT_ENABLED",
+    "true" if RATE_LIMIT_ENABLED else "false"
+).lower() == "true"
+API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE = int(
+    os.getenv("API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE", "60")
+)
+API_RATE_LIMIT_ANONYMOUS_PER_MINUTE = int(
+    os.getenv("API_RATE_LIMIT_ANONYMOUS_PER_MINUTE", "30")
+)
+API_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
+API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = int(
+    os.getenv("API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS", "30")
+)
+API_RATE_LIMIT_EXEMPT_PATHS_STR = os.getenv(
+    "API_RATE_LIMIT_EXEMPT_PATHS",
+    "/health,/ready,/docs,/redoc,/openapi.json"
+)
+API_RATE_LIMIT_EXEMPT_PATHS: Set[str] = {
+    path.strip()
+    for path in API_RATE_LIMIT_EXEMPT_PATHS_STR.split(",")
+    if path.strip()
+}
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -202,14 +231,64 @@ def validate_configuration() -> None:
     
     if MAX_FILE_SIZE_MB < 1 or MAX_FILE_SIZE_MB > 500:
         errors.append(f"MAX_FILE_SIZE_MB out of range: {MAX_FILE_SIZE_MB} (must be 1-500)")
+
+    if CRAWL_CONNECT_TIMEOUT <= 0:
+        errors.append("CRAWL_CONNECT_TIMEOUT must be > 0")
+
+    if CRAWL_READ_TIMEOUT <= 0:
+        errors.append("CRAWL_READ_TIMEOUT must be > 0")
+
+    if CRAWL_TOTAL_TIMEOUT <= 0:
+        errors.append("CRAWL_TOTAL_TIMEOUT must be > 0")
+
+    if CRAWL_TOTAL_TIMEOUT < max(CRAWL_CONNECT_TIMEOUT, CRAWL_READ_TIMEOUT):
+        errors.append(
+            "CRAWL_TOTAL_TIMEOUT must be >= max(CRAWL_CONNECT_TIMEOUT, CRAWL_READ_TIMEOUT)"
+        )
+
+    if CRAWL_MAX_RETRIES < 0 or CRAWL_MAX_RETRIES > 10:
+        errors.append("CRAWL_MAX_RETRIES out of range (must be 0-10)")
+
+    # Validate API rate limiting
+    if API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE < 1:
+        errors.append(
+            "API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE must be >= 1"
+        )
+
+    if API_RATE_LIMIT_ANONYMOUS_PER_MINUTE < 1:
+        errors.append(
+            "API_RATE_LIMIT_ANONYMOUS_PER_MINUTE must be >= 1"
+        )
+
+    if API_RATE_LIMIT_WINDOW_SECONDS < 1 or API_RATE_LIMIT_WINDOW_SECONDS > 3600:
+        errors.append(
+            f"API_RATE_LIMIT_WINDOW_SECONDS out of range: {API_RATE_LIMIT_WINDOW_SECONDS} (must be 1-3600)"
+        )
+
+    if (
+        API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS < 1
+        or API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS > 3600
+    ):
+        errors.append(
+            "API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS out of range: "
+            f"{API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS} (must be 1-3600)"
+        )
+
+    invalid_exempt_paths = [
+        path for path in API_RATE_LIMIT_EXEMPT_PATHS if not path.startswith("/")
+    ]
+    if invalid_exempt_paths:
+        errors.append(
+            f"API_RATE_LIMIT_EXEMPT_PATHS must contain absolute paths only: {invalid_exempt_paths}"
+        )
     
     # Production-specific validation
     if IS_PRODUCTION:
         if "insecure" in SECRET_KEY.lower() or "dev" in SECRET_KEY.lower():
             errors.append("SECRET_KEY appears to be a development key in production")
         
-        if not RATE_LIMIT_ENABLED:
-            warnings.append("Rate limiting disabled in production - verify this is intended")
+        if not API_RATE_LIMIT_ENABLED:
+            warnings.append("API rate limiting disabled in production - verify this is intended")
     
     # Report warnings
     for warning in warnings:
@@ -225,7 +304,7 @@ def validate_configuration() -> None:
     logger.info("Configuration validation passed")
     logger.info(f"Environment: {ENVIRONMENT}")
     logger.info(f"Max concurrent crawls: {MAX_CONCURRENT_CRAWLS}")
-    logger.info(f"Rate limiting: {'enabled' if RATE_LIMIT_ENABLED else 'disabled'}")
+    logger.info(f"API rate limiting: {'enabled' if API_RATE_LIMIT_ENABLED else 'disabled'}")
     logger.info(f"Storage directory: {RAW_STORAGE_DIR}")
 
 
@@ -251,7 +330,9 @@ __all__ = [
     # Crawl
     'MAX_PAGES_DEFAULT', 'MAX_PAGES_ABSOLUTE',
     'MAX_MINUTES_DEFAULT', 'MAX_MINUTES_ABSOLUTE',
-    'REQUEST_DELAY', 'CRAWL_TIMEOUT', 'CRAWL_MAX_RETRIES',
+    'REQUEST_DELAY',
+    'CRAWL_CONNECT_TIMEOUT', 'CRAWL_READ_TIMEOUT', 'CRAWL_TOTAL_TIMEOUT',
+    'CRAWL_TIMEOUT', 'CRAWL_MAX_RETRIES',
     'USER_AGENT', 'MAX_CONCURRENT_CRAWLS',
     
     # Files
@@ -262,6 +343,12 @@ __all__ = [
     # Rate limiting
     'RATE_LIMIT_ENABLED', 'RATE_LIMIT_CRAWL_START',
     'RATE_LIMIT_DELAY_MIN', 'RATE_LIMIT_DELAY_MAX',
+    'API_RATE_LIMIT_ENABLED',
+    'API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE',
+    'API_RATE_LIMIT_ANONYMOUS_PER_MINUTE',
+    'API_RATE_LIMIT_WINDOW_SECONDS',
+    'API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS',
+    'API_RATE_LIMIT_EXEMPT_PATHS',
     
     # Logging
     'LOG_LEVEL', 'LOG_FORMAT', 'LOG_JSON_FORMAT',

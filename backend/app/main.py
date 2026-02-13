@@ -1,36 +1,48 @@
 """PolicyCheck v6 - Production-Hardened Ingestion Platform."""
+import asyncio
 import logging
 import signal
 import sys
-from contextlib import asynccontextmanager
+import time
+from collections import deque
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from jose import JWTError, jwt
 
 from app.config import (
+    ALGORITHM,
+    API_RATE_LIMIT_ANONYMOUS_PER_MINUTE,
+    API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE,
+    API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS,
+    API_RATE_LIMIT_ENABLED,
+    API_RATE_LIMIT_EXEMPT_PATHS,
+    API_RATE_LIMIT_WINDOW_SECONDS,
     CORS_ORIGINS,
-    RAW_STORAGE_DIR,
-    LOG_LEVEL,
-    LOG_FORMAT,
     IS_PRODUCTION,
+    LOG_FORMAT,
+    LOG_LEVEL,
+    RAW_STORAGE_DIR,
+    SECRET_KEY,
     validate_configuration,
 )
 from app.database import (
-    init_db,
     check_database_health,
     dispose_engine,
     get_pool_status,
+    init_db,
 )
 from app.services import crawl_service
 from app.routers import (
+    audit_router,
     auth_router,
     crawl_router,
     documents_router,
-    system_router,
     stats_router,
-    audit_router,
+    system_router,
 )
 
 # ============================================================================
@@ -65,6 +77,113 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 # ============================================================================
+# RATE LIMITING
+# ============================================================================
+
+
+class InMemoryRateLimiter:
+    """Simple in-memory sliding window limiter with async cleanup."""
+
+    def __init__(self, window_seconds: int, cleanup_interval_seconds: int):
+        self.window_seconds = window_seconds
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        self._requests: dict[str, deque[float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def check_and_increment(self, key: str, limit: int) -> tuple[bool, int]:
+        """Return (allowed, retry_after_seconds)."""
+        now = time.monotonic()
+        window_start = now - self.window_seconds
+
+        async with self._lock:
+            bucket = self._requests.setdefault(key, deque())
+
+            while bucket and bucket[0] <= window_start:
+                bucket.popleft()
+
+            if len(bucket) >= limit:
+                retry_after_seconds = max(1, int(bucket[0] + self.window_seconds - now + 0.999))
+                return False, retry_after_seconds
+
+            bucket.append(now)
+            return True, 0
+
+    async def cleanup_once(self) -> None:
+        """Remove expired entries to prevent unbounded memory growth."""
+        now = time.monotonic()
+        window_start = now - self.window_seconds
+
+        async with self._lock:
+            keys_to_delete = []
+            for key, bucket in self._requests.items():
+                while bucket and bucket[0] <= window_start:
+                    bucket.popleft()
+                if not bucket:
+                    keys_to_delete.append(key)
+
+            for key in keys_to_delete:
+                del self._requests[key]
+
+    async def cleanup_loop(self) -> None:
+        """Background cleanup task for stale limiter keys."""
+        while True:
+            await asyncio.sleep(self.cleanup_interval_seconds)
+            await self.cleanup_once()
+
+
+rate_limiter = InMemoryRateLimiter(
+    window_seconds=API_RATE_LIMIT_WINDOW_SECONDS,
+    cleanup_interval_seconds=API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS,
+)
+
+
+def _is_rate_limit_exempt_path(path: str) -> bool:
+    """Check if request path is exempt from API rate limiting."""
+    for exempt_path in API_RATE_LIMIT_EXEMPT_PATHS:
+        if path == exempt_path or path.startswith(f"{exempt_path}/"):
+            return True
+    return False
+
+
+def _client_ip(request: Request) -> str:
+    """Resolve client IP with proxy header support."""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _extract_authenticated_identity(request: Request) -> str | None:
+    """
+    Extract authenticated identity from JWT for per-user rate limiting.
+
+    Uses explicit user id claims when present, and falls back to `sub`
+    to remain compatible with existing tokens.
+    """
+    auth_header = request.headers.get("authorization")
+    if not auth_header:
+        return None
+
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+
+    user_id = payload.get("user_id") or payload.get("uid")
+    if user_id is not None:
+        return str(user_id)
+
+    subject = payload.get("sub")
+    if subject is not None:
+        return str(subject)
+
+    return None
+
+# ============================================================================
 # LIFESPAN
 # ============================================================================
 
@@ -81,10 +200,26 @@ async def lifespan(app: FastAPI):
     if not check_database_health():
         raise RuntimeError("Database health check failed after init")
 
+    rate_limit_cleanup_task = None
+    if API_RATE_LIMIT_ENABLED:
+        rate_limit_cleanup_task = asyncio.create_task(rate_limiter.cleanup_loop())
+        logger.info(
+            "API rate limiting enabled: auth=%s/min anonymous=%s/min window=%ss",
+            API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE,
+            API_RATE_LIMIT_ANONYMOUS_PER_MINUTE,
+            API_RATE_LIMIT_WINDOW_SECONDS,
+        )
+    else:
+        logger.warning("API rate limiting disabled")
+
     logger.info("Startup complete")
     yield
 
     logger.info("Shutting down...")
+    if rate_limit_cleanup_task:
+        rate_limit_cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await rate_limit_cleanup_task
     dispose_engine()
     logger.info("Shutdown complete")
 
@@ -114,6 +249,42 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Apply per-user/IP API rate limits and return 429 with Retry-After."""
+    if not API_RATE_LIMIT_ENABLED:
+        return await call_next(request)
+
+    if _is_rate_limit_exempt_path(request.url.path):
+        return await call_next(request)
+
+    identity = _extract_authenticated_identity(request)
+    if identity:
+        rate_limit_key = f"user:{identity}"
+        limit = API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE
+    else:
+        rate_limit_key = f"ip:{_client_ip(request)}"
+        limit = API_RATE_LIMIT_ANONYMOUS_PER_MINUTE
+
+    allowed, retry_after = await rate_limiter.check_and_increment(rate_limit_key, limit)
+    if not allowed:
+        logger.warning(
+            "Rate limit exceeded key=%s method=%s path=%s retry_after=%s",
+            rate_limit_key,
+            request.method,
+            request.url.path,
+            retry_after,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Retry-After": str(retry_after)},
+            content={"detail": "Rate limit exceeded. Please retry later."},
+        )
+
+    return await call_next(request)
+
 
 # ============================================================================
 # ROUTERS
