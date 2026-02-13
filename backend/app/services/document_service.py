@@ -25,6 +25,7 @@ from typing import List, Optional, Generator
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.cache import invalidate_cache_prefix
 from app.models import Document, CrawlSession
 from app.config import RAW_STORAGE_DIR, STORAGE_DIR
 
@@ -346,6 +347,8 @@ def reset_system(db: Session) -> dict:
             f"System reset completed: {result['status']}, "
             f"{file_errors and len(file_errors) or 0} file errors"
         )
+        invalidate_cache_prefix("stats:")
+        invalidate_cache_prefix("documents:")
         
         return result
     

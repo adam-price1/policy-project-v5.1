@@ -17,6 +17,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
+from app.cache import get_cached_json, make_cache_key, set_cached_json
+from app.config import CACHE_DEFAULT_TTL_SECONDS
 from app.database import get_db
 from app.models import User
 from app.services import document_service
@@ -24,6 +26,7 @@ from app.auth import get_current_user, get_current_user_optional
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
+DOCUMENTS_CACHE_TTL_SECONDS = min(max(CACHE_DEFAULT_TTL_SECONDS, 15), 180)
 
 # ============================================================================
 # SCHEMAS
@@ -134,6 +137,18 @@ def list_documents(
     Returns:
         DocumentListResponse with documents and pagination metadata
     """
+    cache_key = make_cache_key(
+        "documents",
+        "list",
+        f"user:{current_user.id}",
+        f"crawl:{crawl_session_id or 'all'}",
+        f"limit:{limit}",
+        f"offset:{offset}",
+    )
+    cached_payload = get_cached_json(cache_key)
+    if cached_payload is not None:
+        return DocumentListResponse(**cached_payload)
+
     # Get total count (for pagination metadata)
     total = document_service.get_document_count(db, crawl_session_id)
     
@@ -164,13 +179,15 @@ def list_documents(
         for doc in docs
     ]
     
-    return DocumentListResponse(
+    response = DocumentListResponse(
         documents=document_responses,
         total=total,
         limit=limit,
         offset=offset,
         has_more=(offset + len(docs)) < total
     )
+    set_cached_json(cache_key, response.model_dump(mode="json"), DOCUMENTS_CACHE_TTL_SECONDS)
+    return response
 
 
 @router.get("/{document_id}/download")
@@ -334,6 +351,13 @@ def get_document_stats(
     Returns:
         DocumentStatsResponse with system statistics
     """
+    cache_key = make_cache_key("documents", "summary", f"user:{current_user.id}")
+    cached_payload = get_cached_json(cache_key)
+    if cached_payload is not None:
+        return DocumentStatsResponse(**cached_payload)
+
     stats = document_service.get_document_stats(db)
-    
-    return DocumentStatsResponse(**stats)
+    response = DocumentStatsResponse(**stats)
+    set_cached_json(cache_key, response.model_dump(mode="json"), DOCUMENTS_CACHE_TTL_SECONDS)
+
+    return response

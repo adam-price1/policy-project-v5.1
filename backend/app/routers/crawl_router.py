@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
+from app.cache import invalidate_cache_prefix
 from app.database import get_db
 from app.models import User, Document
 from app.services import crawl_service
@@ -109,6 +110,8 @@ def _start_crawl_logic(
         )
         background_tasks.add_task(crawl_service.run_crawl_session, session.id)
         active = crawl_service.get_active_crawl_count()
+        invalidate_cache_prefix("stats:")
+        invalidate_cache_prefix("documents:")
 
         return CrawlResponse(
             crawl_id=session.id,

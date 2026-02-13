@@ -10,14 +10,16 @@ from collections import deque
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.openapi.utils import get_openapi
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from jose import JWTError, jwt
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.auth import validate_csrf_token
+from app.cache import close_cache, get_cache_status, init_cache
 from app.config import (
     ALGORITHM,
     API_RATE_LIMIT_ANONYMOUS_PER_MINUTE,
@@ -26,10 +28,12 @@ from app.config import (
     API_RATE_LIMIT_ENABLED,
     API_RATE_LIMIT_EXEMPT_PATHS,
     API_RATE_LIMIT_WINDOW_SECONDS,
+    CACHE_ENABLED,
     CORS_ORIGINS,
     IS_PRODUCTION,
     LOG_FORMAT,
     LOG_LEVEL,
+    METRICS_ENABLED,
     RAW_STORAGE_DIR,
     SECRET_KEY,
     validate_configuration,
@@ -81,6 +85,26 @@ for handler in logging.getLogger().handlers:
 if IS_PRODUCTION:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
+# ============================================================================
+# METRICS
+# ============================================================================
+
+http_requests_total = Counter(
+    "http_requests_total",
+    "Total number of HTTP requests",
+    ["method", "endpoint", "status_code"],
+)
+http_request_duration_seconds = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "endpoint"],
+)
+http_requests_in_progress = Gauge(
+    "http_requests_in_progress",
+    "Number of HTTP requests currently in progress",
+    ["method", "endpoint"],
+)
 
 # ============================================================================
 # GRACEFUL SHUTDOWN
@@ -222,6 +246,20 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _metrics_endpoint_label(request: Request) -> str:
+    """
+    Build a stable endpoint label to avoid high-cardinality metrics.
+
+    Prefer route templates like `/api/crawl/{crawl_id}/status` when available.
+    """
+    route = request.scope.get("route")
+    if route is not None and hasattr(route, "path"):
+        route_path = getattr(route, "path", None)
+        if isinstance(route_path, str) and route_path:
+            return _to_legacy_api_path(route_path)
+    return _to_legacy_api_path(_request_path(request))
+
+
 def _extract_authenticated_identity(request: Request) -> str | None:
     """
     Extract authenticated identity from JWT for per-user rate limiting.
@@ -288,6 +326,8 @@ async def lifespan(app: FastAPI):
     if not check_database_health():
         raise RuntimeError("Database health check failed after init")
 
+    init_cache()
+
     rate_limit_cleanup_task = None
     if API_RATE_LIMIT_ENABLED:
         rate_limit_cleanup_task = asyncio.create_task(rate_limiter.cleanup_loop())
@@ -308,6 +348,7 @@ async def lifespan(app: FastAPI):
         rate_limit_cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await rate_limit_cleanup_task
+    close_cache()
     dispose_engine()
     logger.info("Shutdown complete")
 
@@ -337,6 +378,33 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """Collect request count/latency metrics when enabled."""
+    if not METRICS_ENABLED:
+        return await call_next(request)
+
+    method = request.method
+    endpoint = _metrics_endpoint_label(request)
+    status_code = 500
+    start = time.perf_counter()
+
+    http_requests_in_progress.labels(method=method, endpoint=endpoint).inc()
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration = time.perf_counter() - start
+        http_request_duration_seconds.labels(method=method, endpoint=endpoint).observe(duration)
+        http_requests_total.labels(
+            method=method,
+            endpoint=endpoint,
+            status_code=str(status_code),
+        ).inc()
+        http_requests_in_progress.labels(method=method, endpoint=endpoint).dec()
 
 
 @app.middleware("http")
@@ -511,6 +579,7 @@ def root():
 
 @app.get("/health")
 def health():
+    """Comprehensive health check for operators."""
     if shutdown_event:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -518,16 +587,22 @@ def health():
         )
     try:
         db_healthy = check_database_health()
+        cache_status = get_cache_status()
+        storage_available = RAW_STORAGE_DIR.exists()
+        cache_ready = bool(cache_status.get("connected", False))
+
         pool_stats = get_pool_status()
         active_crawls = crawl_service.get_active_crawl_count()
+        all_ready = db_healthy and storage_available and (not CACHE_ENABLED or cache_ready)
         health_data = {
-            "status": "healthy" if db_healthy else "degraded",
+            "status": "healthy" if all_ready else "degraded",
             "version": "6.0.0",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": {
                 "connected": db_healthy,
                 "pool": pool_stats,
             },
+            "cache": cache_status,
             "services": {
                 "crawl": {
                     "active": active_crawls,
@@ -535,12 +610,12 @@ def health():
                 }
             },
             "storage": {
-                "available": RAW_STORAGE_DIR.exists(),
+                "available": storage_available,
                 "path": str(RAW_STORAGE_DIR),
             },
         }
 
-        if db_healthy:
+        if all_ready:
             return health_data
 
         return JSONResponse(
@@ -558,11 +633,51 @@ def health():
         )
 
 
-@app.get("/ready")
-def readiness():
+@app.get("/health/liveness")
+def liveness():
+    """Liveness probe - checks that process is alive and not shutting down."""
     if shutdown_event:
-        return JSONResponse(status_code=503, content={"ready": False})
-    return {"ready": True}
+        return JSONResponse(status_code=503, content={"status": "shutting_down"})
+    return {"status": "alive", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/health/readiness")
+def readiness():
+    """Readiness probe - checks dependencies needed to serve traffic."""
+    db_healthy = check_database_health()
+    cache_status = get_cache_status()
+    storage_available = RAW_STORAGE_DIR.exists()
+    cache_ready = bool(cache_status.get("connected", False))
+
+    checks = {
+        "database": db_healthy,
+        "cache": cache_ready if CACHE_ENABLED else True,
+        "storage": storage_available,
+    }
+    ready = all(checks.values()) and not shutdown_event
+
+    payload = {
+        "ready": ready,
+        "checks": checks,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if not ready:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
+@app.get("/ready")
+def legacy_readiness_alias():
+    """Legacy readiness alias kept for backward compatibility."""
+    return readiness()
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    """Prometheus metrics endpoint."""
+    if not METRICS_ENABLED:
+        raise HTTPException(status_code=404, detail="Metrics are disabled")
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # ============================================================================

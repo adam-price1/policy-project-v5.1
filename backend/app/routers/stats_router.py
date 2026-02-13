@@ -4,12 +4,15 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
+from app.cache import get_cached_json, make_cache_key, set_cached_json
+from app.config import CACHE_DEFAULT_TTL_SECONDS
 from app.database import get_db
 from app.models import User, CrawlSession, Document, AuditLog
 from app.auth import get_current_user
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
 logger = logging.getLogger(__name__)
+STATS_CACHE_TTL_SECONDS = min(max(CACHE_DEFAULT_TTL_SECONDS, 10), 300)
 
 
 @router.get("/pipeline")
@@ -18,6 +21,11 @@ def get_pipeline_stats(
     current_user: User = Depends(get_current_user),
 ):
     """Return pipeline stage counts and funnel conversion rates."""
+    cache_key = make_cache_key("stats", "pipeline", f"user:{current_user.id}")
+    cached_payload = get_cached_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
     try:
         total_sessions = db.query(CrawlSession).count()
         running = db.query(CrawlSession).filter(CrawlSession.status == "running").count()
@@ -65,13 +73,15 @@ def get_pipeline_stats(
 
         avg_conf_row = db.query(func.avg(Document.confidence)).scalar()
 
-        return {
+        result = {
             "stages": stages,
             "funnel_rates": funnel_rates,
             "total_processed": total_docs,
             "avg_confidence": round(float(avg_conf_row or 0), 3),
             "error_rate": safe_rate(failed, total_sessions),
         }
+        set_cached_json(cache_key, result, STATS_CACHE_TTL_SECONDS)
+        return result
 
     except Exception as e:
         logger.error(f"Error computing pipeline stats: {e}", exc_info=True)
@@ -90,6 +100,11 @@ def get_dashboard_stats(
     current_user: User = Depends(get_current_user),
 ):
     """Return high-level dashboard statistics."""
+    cache_key = make_cache_key("stats", "dashboard", f"user:{current_user.id}")
+    cached_payload = get_cached_json(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
     try:
         total_docs = db.query(Document).count()
         pending = db.query(Document).filter(Document.status == "pending").count()
@@ -123,7 +138,7 @@ def get_dashboard_stats(
             for e in recent_entries
         ]
 
-        return {
+        result = {
             "total_documents": total_docs,
             "needs_review": pending,
             "auto_approved": 0,
@@ -132,6 +147,8 @@ def get_dashboard_stats(
             "by_country": by_country,
             "recent_activity": recent_activity,
         }
+        set_cached_json(cache_key, result, STATS_CACHE_TTL_SECONDS)
+        return result
 
     except Exception as e:
         logger.error(f"Error computing dashboard stats: {e}", exc_info=True)

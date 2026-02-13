@@ -42,6 +42,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from urllib3.util.timeout import Timeout
 from urllib3.util.retry import Retry
 
+from app.cache import invalidate_cache_prefix
 from app.models import CrawlSession, Document, User
 from app.config import (
     RAW_STORAGE_DIR, REQUEST_DELAY,
@@ -1096,6 +1097,13 @@ def run_crawl_session(session_id: int):
                 logger.error(
                     f"[Crawl {session_id}] Error closing HTTP session: {e}"
                 )
+
+        # Best-effort cache invalidation so dashboards reflect crawl updates quickly.
+        try:
+            invalidate_cache_prefix("stats:")
+            invalidate_cache_prefix("documents:")
+        except Exception as e:
+            logger.debug(f"[Crawl {session_id}] Cache invalidation failed: {e}")
         
         # CRITICAL: Unregister from active crawls
         unregister_active_crawl(session_id)

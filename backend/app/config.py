@@ -164,7 +164,7 @@ API_RATE_LIMIT_CLEANUP_INTERVAL_SECONDS = int(
 )
 API_RATE_LIMIT_EXEMPT_PATHS_STR = os.getenv(
     "API_RATE_LIMIT_EXEMPT_PATHS",
-    "/health,/ready,/docs,/redoc,/openapi.json"
+    "/health,/health/liveness,/health/readiness,/ready,/metrics,/docs,/redoc,/openapi.json"
 )
 API_RATE_LIMIT_EXEMPT_PATHS: Set[str] = {
     path.strip()
@@ -189,6 +189,21 @@ LOG_JSON_FORMAT = os.getenv("LOG_JSON_FORMAT", "false").lower() == "true"
 
 METRICS_ENABLED = os.getenv("METRICS_ENABLED", "false").lower() == "true"
 METRICS_PORT = int(os.getenv("METRICS_PORT", "9090"))
+
+# ============================================================================
+# CACHE & REDIS
+# ============================================================================
+
+CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
+CACHE_DEFAULT_TTL_SECONDS = int(os.getenv("CACHE_DEFAULT_TTL_SECONDS", "60"))
+CACHE_KEY_PREFIX = os.getenv("CACHE_KEY_PREFIX", "policycheck")
+
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+REDIS_SSL = os.getenv("REDIS_SSL", "false").lower() == "true"
+REDIS_SOCKET_TIMEOUT_SECONDS = float(os.getenv("REDIS_SOCKET_TIMEOUT_SECONDS", "1.5"))
 
 # ============================================================================
 # STARTUP VALIDATION
@@ -248,6 +263,22 @@ def validate_configuration() -> None:
 
     if CRAWL_MAX_RETRIES < 0 or CRAWL_MAX_RETRIES > 10:
         errors.append("CRAWL_MAX_RETRIES out of range (must be 0-10)")
+    
+    # Validate cache/redis configuration
+    if CACHE_DEFAULT_TTL_SECONDS < 1 or CACHE_DEFAULT_TTL_SECONDS > 86400:
+        errors.append(
+            "CACHE_DEFAULT_TTL_SECONDS out of range "
+            f"({CACHE_DEFAULT_TTL_SECONDS}; must be 1-86400)"
+        )
+
+    if REDIS_PORT < 1 or REDIS_PORT > 65535:
+        errors.append(f"REDIS_PORT out of range: {REDIS_PORT}")
+
+    if REDIS_DB < 0 or REDIS_DB > 15:
+        warnings.append(f"REDIS_DB is unusual ({REDIS_DB}); verify Redis config")
+
+    if REDIS_SOCKET_TIMEOUT_SECONDS <= 0:
+        errors.append("REDIS_SOCKET_TIMEOUT_SECONDS must be > 0")
 
     # Validate API rate limiting
     if API_RATE_LIMIT_AUTHENTICATED_PER_MINUTE < 1:
@@ -355,6 +386,11 @@ __all__ = [
     
     # Monitoring
     'METRICS_ENABLED', 'METRICS_PORT',
+
+    # Cache/Redis
+    'CACHE_ENABLED', 'CACHE_DEFAULT_TTL_SECONDS', 'CACHE_KEY_PREFIX',
+    'REDIS_HOST', 'REDIS_PORT', 'REDIS_DB', 'REDIS_PASSWORD', 'REDIS_SSL',
+    'REDIS_SOCKET_TIMEOUT_SECONDS',
     
     # URL normalization
     'TRACKING_PARAMS',

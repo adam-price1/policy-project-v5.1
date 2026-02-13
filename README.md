@@ -12,6 +12,7 @@ docker-compose up --build
 #    Frontend:  http://localhost
 #    API Docs:  http://localhost/docs
 #    Backend:   http://localhost:8000
+#    Metrics:   http://localhost:8000/metrics (if METRICS_ENABLED=true)
 ```
 
 ## API Versioning
@@ -64,6 +65,7 @@ Then log in at **http://localhost/login** with `admin / admin123`.
 ```
 Browser -> :80 Nginx -> serves React SPA
                     -> proxies /api/* -> :8000 FastAPI -> MySQL :3306
+                                                 -> Redis :6379 (cache)
 ```
 
 ## API Endpoints
@@ -71,6 +73,9 @@ Browser -> :80 Nginx -> serves React SPA
 | Method | Path                       | Auth | Description           |
 |--------|----------------------------|------|-----------------------|
 | GET    | /health                    | No   | Health check          |
+| GET    | /health/liveness           | No   | Liveness probe        |
+| GET    | /health/readiness          | No   | Readiness probe       |
+| GET    | /metrics                   | No   | Prometheus metrics    |
 | POST   | /api/v1/auth/login         | No   | Login -> JWT          |
 | POST   | /api/v1/auth/register      | No   | Register user         |
 | GET    | /api/v1/auth/me            | Yes  | Current user info     |
