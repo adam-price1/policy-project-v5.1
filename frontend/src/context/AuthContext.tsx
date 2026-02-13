@@ -50,6 +50,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const response = await authApi.login(credentials);
     localStorage.setItem('access_token', response.access_token);
+    localStorage.setItem('csrf_token', response.csrf_token);
     localStorage.setItem('user', JSON.stringify(response.user));
     setUser(response.user);
     setToken(response.access_token);
@@ -57,6 +58,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const logout = () => {
     localStorage.removeItem('access_token');
+    localStorage.removeItem('csrf_token');
     localStorage.removeItem('user');
     setUser(null);
     setToken(null);

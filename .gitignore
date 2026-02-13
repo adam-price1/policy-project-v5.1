@@ -5,6 +5,7 @@ venv/
 
 # Environment
 .env
+backend/.env
 
 # Storage
 storage/

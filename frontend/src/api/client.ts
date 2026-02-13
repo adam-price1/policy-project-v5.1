@@ -8,6 +8,7 @@ import axios, { AxiosError, InternalAxiosRequestConfig, AxiosResponse } from 'ax
 // In production (Docker/nginx), use empty string so requests go to same origin.
 // In dev (vite), vite.config proxy forwards /api to localhost:8000.
 const API_URL = import.meta.env.VITE_API_URL || '';
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 const client = axios.create({
   baseURL: API_URL,
@@ -23,6 +24,15 @@ client.interceptors.request.use(
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
+
+    const method = (config.method || 'GET').toUpperCase();
+    if (MUTATING_METHODS.has(method)) {
+      const csrfToken = localStorage.getItem('csrf_token');
+      if (csrfToken) {
+        config.headers['x-csrf-token'] = csrfToken;
+      }
+    }
+
     return config;
   },
   (error: AxiosError) => Promise.reject(error)
@@ -34,6 +44,7 @@ client.interceptors.response.use(
   (error: AxiosError) => {
     if (error.response?.status === 401) {
       localStorage.removeItem('access_token');
+      localStorage.removeItem('csrf_token');
       localStorage.removeItem('user');
       // Only redirect if not already on login page
       if (!window.location.pathname.startsWith('/login')) {
