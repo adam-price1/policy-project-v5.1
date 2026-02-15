@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
@@ -20,13 +20,36 @@ from sqlalchemy.orm import Session
 from app.cache import get_cached_json, make_cache_key, set_cached_json
 from app.config import CACHE_DEFAULT_TTL_SECONDS
 from app.database import get_db
-from app.models import User
+from app.models import AuditLog, User
 from app.services import document_service
 from app.auth import get_current_user, get_current_user_optional
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 logger = logging.getLogger(__name__)
 DOCUMENTS_CACHE_TTL_SECONDS = min(max(CACHE_DEFAULT_TTL_SECONDS, 15), 180)
+
+
+def _write_download_audit(
+    db: Session,
+    current_user: User,
+    action: str,
+    details: dict,
+    document_id: Optional[int] = None,
+) -> None:
+    """Persist download audit logs without breaking the main request path."""
+    try:
+        entry = AuditLog(
+            action=action,
+            details=details,
+            user_id=current_user.id,
+            user_name=current_user.name or current_user.username,
+            document_id=document_id,
+        )
+        db.add(entry)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("Failed to write audit log for action=%s: %s", action, exc)
 
 # ============================================================================
 # SCHEMAS
@@ -194,6 +217,7 @@ def list_documents(
 def download_document(
     document_id: int,
     token: Optional[str] = Query(None, description="Optional download token (query param auth)"),
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
@@ -257,6 +281,20 @@ def download_document(
     logger.info(
         f"User {current_user.username} downloading document {document_id}: {filename}"
     )
+
+    _write_download_audit(
+        db=db,
+        current_user=current_user,
+        action="document_download",
+        document_id=document_id,
+        details={
+            "filename": filename,
+            "source_url": doc.source_url,
+            "country": doc.country,
+            "policy_type": doc.policy_type,
+            "ip_address": request.client.host if request and request.client else None,
+        },
+    )
     
     return FileResponse(
         path=str(file_path),
@@ -269,6 +307,7 @@ def download_document(
 def download_all_documents(
     crawl_session_id: Optional[int] = Query(None, description="Filter by crawl session ID"),
     token: Optional[str] = Query(None, description="Optional download token"),
+    request: Request = None,
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user_optional)
 ):
@@ -329,6 +368,17 @@ def download_all_documents(
     
     # Generate filename
     zip_filename = f"policycheck_documents_{crawl_session_id or 'all'}.zip"
+
+    _write_download_audit(
+        db=db,
+        current_user=current_user,
+        action="documents_bulk_download",
+        details={
+            "filename": zip_filename,
+            "crawl_session_id": crawl_session_id,
+            "ip_address": request.client.host if request and request.client else None,
+        },
+    )
     
     # CRITICAL: Return StreamingResponse instead of FileResponse
     return StreamingResponse(
